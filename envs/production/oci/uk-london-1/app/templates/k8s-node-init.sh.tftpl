@@ -8,9 +8,11 @@
 # firewall (Oracle's Ubuntu images default to a restrictive iptables INPUT chain that blocks
 # ports the NSG already allows), and installs containerd + kubeadm/kubelet/kubectl.
 #
-# Control-plane node only: runs `kubeadm init`, installs the Flannel CNI, and saves a
+# Control-plane node only: runs `kubeadm init`, installs the Calico CNI, and saves a
 # `kubeadm join` command to /home/ubuntu/kubeadm-join.sh for you to run on each worker by hand
-# (see README.md) — that step is left manual on purpose, it's CKA-exam-relevant.
+# (see README.md) — that step is left manual on purpose, it's CKA-exam-relevant. Calico (not
+# Flannel) specifically because Flannel doesn't enforce NetworkPolicy objects — they'd apply
+# but silently do nothing, which defeats practicing a recurring CKA topic.
 set -euxo pipefail
 
 exec > >(tee /var/log/k8s-node-init.log) 2>&1
@@ -81,7 +83,10 @@ cp -i /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
 chown -R ubuntu:ubuntu /home/ubuntu/.kube
 export KUBECONFIG=/etc/kubernetes/admin.conf
 
-kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+# `kubectl create`, not `apply` — Calico's CRDs are large enough that `apply`'s
+# last-applied-configuration annotation can exceed etcd's per-object size limit; Calico's own
+# docs use `create` for this manifest for that reason.
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.32.1/manifests/calico.yaml
 
 # Workers can't self-join: the token/CA hash only exist after this init runs. Save the
 # command here and run it on each worker over SSH — see README.md.

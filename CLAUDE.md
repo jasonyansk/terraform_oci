@@ -73,7 +73,8 @@ Each entry in `app/variables.tf`'s `instances` map has a `role` (`"control-plane
 optional static `private_ip`. `app/main.tf` renders `app/templates/k8s-node-init.sh.tftpl` per instance via
 `templatefile()` and passes it in as `user_data_base64` (cloud-init). The template installs
 containerd/kubeadm/kubelet/kubectl on every node; when `role == "control-plane"` it additionally runs
-`kubeadm init` and applies the Flannel CNI. The control-plane's `private_ip` must be set in tfvars because
+`kubeadm init` and applies the Calico CNI (via `kubectl create`, not `apply` — see "kubeadm's hard
+requirements" below for why). The control-plane's `private_ip` must be set in tfvars because
 `--apiserver-advertise-address` has to be known before the instance exists (a static IP breaks the
 chicken-and-egg problem of needing the instance's own address inside its own boot-time user-data). Workers
 are deliberately **not** auto-joined by Terraform — the join token/CA hash only exist after the
@@ -130,6 +131,21 @@ Two `kubeadm` preflight checks are hard failures (the bootstrap script uses `set
 If `kubeadm-join.sh` is missing from the control-plane's home directory after cloud-init should have
 finished, check `/var/log/k8s-node-init.log` (or `/var/log/cloud-init-output.log`) there first — a preflight
 failure like the above is far more likely than cloud-init still running.
+
+### CNI is Calico, not Flannel — and its pod CIDR default drives `var.pod_network_cidr`
+
+Calico was chosen over the more common Flannel specifically because Flannel doesn't enforce `NetworkPolicy`
+objects — they'd apply cleanly and just do nothing, which silently defeats practicing a recurring CKA topic.
+The tradeoff: Calico's stock manifest (`calico.yaml`) hardcodes its default IP pool to `192.168.0.0/16` and
+has `CALICO_IPV4POOL_CIDR` commented out, so it ignores whatever `--pod-network-cidr` `kubeadm init` was
+given. Rather than uncomment/edit the downloaded manifest, `var.pod_network_cidr`'s default was changed to
+match Calico's own default (`192.168.0.0/16`, not Flannel's conventional `10.244.0.0/16`) so the manifest
+works unedited. If you ever swap CNIs again, re-check this assumption rather than leaving a stale CIDR.
+
+Also: the manifest is applied with `kubectl create -f ...`, not `apply` — Calico's CRDs are large enough
+that `apply`'s last-applied-configuration annotation can exceed etcd's per-object size limit and fail.
+Calico's own docs use `create` for this reason. Re-applying a *changed* manifest later needs `kubectl
+replace`, not `create` (which errors on existing objects) or `apply` (same annotation-size problem).
 
 ### Always Free sizing is fragile — re-verify before resizing
 

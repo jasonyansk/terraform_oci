@@ -40,7 +40,7 @@ exam tests) and split across OCI's **two separate** Always Free compute pools:
 
 | Node                 | Shape                  | Arch    | OCPU  | Memory   | Boot volume | Role                        |
 |-----------------------|-------------------------|---------|-------|----------|-------------|------------------------------|
-| `k8s-control-plane`  | VM.Standard.A1.Flex     | aarch64 | 2     | 12 GB    | 50 GB       | control-plane + Flannel CNI |
+| `k8s-control-plane`  | VM.Standard.A1.Flex     | aarch64 | 2     | 12 GB    | 50 GB       | control-plane + Calico CNI  |
 | `k8s-worker-1`        | VM.Standard.E2.1.Micro  | x86_64  | 1/8   | 1 GB     | 50 GB       | worker                      |
 | `k8s-worker-2`        | VM.Standard.E2.1.Micro  | x86_64  | 1/8   | 1 GB     | 50 GB       | worker                      |
 | **Total**             |                          |         |       |          | **150 GB**  |                              |
@@ -62,10 +62,23 @@ Each node's cloud-init (`app/templates/k8s-node-init.sh.tftpl`) disables swap, o
 (Oracle's Ubuntu images default-deny most inbound traffic at the iptables level even when the NSG allows
 it), and installs containerd + conntrack + kubeadm/kubelet/kubectl (`conntrack` is a hard kubeadm preflight
 requirement not present in Ubuntu 24.04's base image). The control-plane node additionally runs
-`kubeadm init` and applies the [Flannel](https://github.com/flannel-io/flannel) CNI automatically.
+`kubeadm init` and applies the [Calico](https://docs.tigera.io/calico/latest/about/) CNI automatically.
+
+**Calico, not Flannel** — Flannel doesn't enforce `NetworkPolicy` objects; they'd apply but silently have no
+effect, which defeats practicing a recurring CKA topic. Calico's pod IP pool defaults to `192.168.0.0/16`
+(hardcoded in the stock manifest, ignoring `--pod-network-cidr` unless you edit it), so `pod_network_cidr`
+is set to match rather than editing the downloaded manifest.
 
 **Joining the workers is a manual step, on purpose** — running `kubeadm join` yourself is CKA-exam-relevant,
 and it avoids a Terraform apply depending on SSH access to itself. See "Deploying" below.
+
+**What this automates vs. what you still practice**: the CKA exam never has you provision infrastructure —
+you start already logged into a running cluster — so cloud-init handling the first-time `containerd`/
+`kubeadm` install and `kubeadm init` costs you little exam-relevant practice. Everything else is still
+manual on this cluster: `kubeadm join`, RBAC, etcd backup/restore, certificate renewal, cluster upgrades,
+static pod manifests, and (with Calico) `NetworkPolicy`. Worth doing at least once for muscle memory even
+though it isn't directly tested: `kubeadm reset` the control-plane and re-run the full `kubeadm init`/join
+sequence yourself from memory.
 
 ## Deploying
 
@@ -154,6 +167,10 @@ and it avoids a Terraform apply depending on SSH access to itself. See "Deployin
 - **`VM.Standard.E2.1.Micro` is memory-tight**: 1 GB total, shared between the OS, containerd, and kubelet.
   Fine for `kubeadm join`/`kubectl drain`/`cordon` practice, but don't expect to schedule much real
   workload on either worker.
+- **Calico's manifest is applied with `kubectl create`, not `apply`.** Its CRDs are large enough that
+  `apply`'s last-applied-configuration annotation can exceed etcd's per-object size limit and fail —
+  Calico's own docs use `create` for this exact reason. If you ever re-apply the manifest by hand
+  (e.g. to bump the Calico version), use `create` too, or `replace` for updates to an existing install.
 
 ## Authentication
 

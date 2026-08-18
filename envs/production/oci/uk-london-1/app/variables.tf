@@ -76,7 +76,7 @@ variable "kubernetes_version" {
 }
 
 variable "pod_network_cidr" {
-  description = "Pod network CIDR passed to `kubeadm init` and matched by the Flannel CNI manifest."
+  description = "Pod network CIDR passed to `kubeadm init`. Set to Calico's own default IP pool (192.168.0.0/16) so the stock calico.yaml manifest works unedited — CALICO_IPV4POOL_CIDR is commented out in that manifest, so Calico ignores this flag and always allocates from 192.168.0.0/16 regardless; changing this value alone would desync kubeadm's view of the pod CIDR from what Calico actually hands out."
   type        = string
-  default     = "10.244.0.0/16"
+  default     = "192.168.0.0/16"
 }
