@@ -1,0 +1,91 @@
+#!/bin/bash
+# Cloud-init bootstrap for a kubeadm Kubernetes node — Ubuntu, OCI Always Free tier. The
+# cluster mixes architectures (Ampere A1 aarch64 nodes + an AMD Micro x86_64 node); everything
+# below is installed via apt, which resolves the right per-arch package automatically, so this
+# script needs no arch-specific branching. Rendered by Terraform's templatefile() from app/main.tf.
+#
+# Every node: disables swap, loads the kernel modules/sysctls kubelet needs, opens the host
+# firewall (Oracle's Ubuntu images default to a restrictive iptables INPUT chain that blocks
+# ports the NSG already allows), and installs containerd + kubeadm/kubelet/kubectl.
+#
+# Control-plane node only: runs `kubeadm init`, installs the Flannel CNI, and saves a
+# `kubeadm join` command to /home/ubuntu/kubeadm-join.sh for you to run on each worker by hand
+# (see README.md) — that step is left manual on purpose, it's CKA-exam-relevant.
+set -euxo pipefail
+
+exec > >(tee /var/log/k8s-node-init.log) 2>&1
+
+NODE_NAME="${node_name}"
+
+# --- disable swap (hard requirement for kubelet) ---
+swapoff -a
+sed -ri '/\sswap\s/s/^#?/#/' /etc/fstab
+
+# --- host firewall: Oracle's Ubuntu images default-deny inbound except SSH/ICMP. The NSG
+# already scopes what can reach this box, so just let the host get out of its own way. ---
+iptables -P INPUT ACCEPT
+iptables -F INPUT
+if command -v netfilter-persistent >/dev/null 2>&1; then
+  netfilter-persistent save || true
+fi
+
+# --- kernel modules & sysctls required by the container network / kube-proxy ---
+cat <<'EOF' > /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+modprobe overlay
+modprobe br_netfilter
+
+cat <<'EOF' > /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+sysctl --system
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+
+# --- containerd ---
+apt-get install -y containerd
+mkdir -p /etc/containerd
+containerd config default > /etc/containerd/config.toml
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+systemctl restart containerd
+systemctl enable containerd
+
+# --- kubeadm / kubelet / kubectl ---
+apt-get install -y apt-transport-https ca-certificates curl gpg
+mkdir -p /etc/apt/keyrings
+curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${kubernetes_version}/deb/Release.key" \
+  | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${kubernetes_version}/deb/ /" \
+  > /etc/apt/sources.list.d/kubernetes.list
+apt-get update
+apt-get install -y kubelet kubeadm kubectl
+apt-mark hold kubelet kubeadm kubectl
+
+hostnamectl set-hostname "$NODE_NAME"
+
+%{ if is_control_plane }
+kubeadm init \
+  --pod-network-cidr="${pod_network_cidr}" \
+  --apiserver-advertise-address="${private_ip}" \
+  --node-name="$NODE_NAME"
+
+mkdir -p /home/ubuntu/.kube
+cp -i /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+chown -R ubuntu:ubuntu /home/ubuntu/.kube
+export KUBECONFIG=/etc/kubernetes/admin.conf
+
+kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+
+# Workers can't self-join: the token/CA hash only exist after this init runs. Save the
+# command here and run it on each worker over SSH — see README.md.
+kubeadm token create --print-join-command > /home/ubuntu/kubeadm-join.sh
+chmod 0755 /home/ubuntu/kubeadm-join.sh
+chown ubuntu:ubuntu /home/ubuntu/kubeadm-join.sh
+%{ endif }
+
+echo "k8s-node-init complete for $NODE_NAME"
