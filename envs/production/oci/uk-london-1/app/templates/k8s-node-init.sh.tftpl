@@ -56,7 +56,9 @@ systemctl restart containerd
 systemctl enable containerd
 
 # --- kubeadm / kubelet / kubectl ---
-apt-get install -y apt-transport-https ca-certificates curl gpg
+# conntrack is a hard kubeadm preflight requirement (kube-proxy needs it too) but isn't part
+# of Ubuntu 24.04's base image, unlike containerd's other implicit deps.
+apt-get install -y apt-transport-https ca-certificates curl gpg conntrack
 mkdir -p /etc/apt/keyrings
 curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${kubernetes_version}/deb/Release.key" \
   | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg

@@ -10,10 +10,11 @@ Security Token authentication (no Vault/OIDC) and local state (no remote backend
 
 The `production/uk-london-1` environment's `app` layer specifically provisions a 3-node `kubeadm` Kubernetes
 cluster (1 control-plane + 2 workers) — a CKA study lab, not a generic app-server pool. It's split across
-OCI's two separate Always Free compute pools: 2 nodes on Ampere A1 (aarch64, 1 OCPU/6 GB each = 2 OCPU/12 GB
-total, the full tenancy-wide A1 allowance as of the 2026-08-18 cut — see "Always Free sizing is fragile"
-below) and 1 node on the AMD Micro pool (`VM.Standard.E2.1.Micro`, x86_64, a separate free allowance). See
-README.md for the free-tier sizing table and the deploy/join walkthrough.
+OCI's two separate Always Free compute pools: the control-plane alone takes the entire Ampere A1 allowance
+(aarch64, 2 OCPU/12 GB — the full tenancy-wide A1 pool as of the 2026-08-18 cut, and also the minimum
+`kubeadm init` requires, see "kubeadm's hard requirements" below), and both workers run on the AMD Micro
+pool (`VM.Standard.E2.1.Micro`, x86_64, a separate free allowance, 1/8 OCPU + 1 GB each). See README.md for
+the free-tier sizing table and the deploy/join walkthrough.
 
 ## Commands
 
@@ -105,26 +106,44 @@ so they drift independently if only one is edited.
 ### Instance shape/image architecture must match — this cluster mixes two
 
 `app/terraform.tfvars` uses two different shapes on purpose: `VM.Standard.A1.Flex` (Ampere/ARM, aarch64) for
-`k8s-control-plane`/`k8s-worker-1`, and `VM.Standard.E2.1.Micro` (AMD, x86_64) for `k8s-worker-2`. Each
-needs an image OCID matching its own architecture — an x86_64 image won't boot on the A1 shape and vice
-versa. This is why `instances[key]` has its own optional `source_image_id` (falls back to the top-level
-`var.source_image_id`, which holds the aarch64 default): `k8s-worker-2` sets it explicitly to an x86_64
-image OCID. There's no cross-check for this in Terraform; a mismatch surfaces as an OCI API error or a boot
-failure, not a plan-time error.
+`k8s-control-plane`, and `VM.Standard.E2.1.Micro` (AMD, x86_64) for both workers. Each needs an image OCID
+matching its own architecture — an x86_64 image won't boot on the A1 shape and vice versa. This is why
+`instances[key]` has its own optional `source_image_id` (falls back to the top-level `var.source_image_id`,
+which holds the aarch64 default): both workers set it explicitly to an x86_64 image OCID. There's no
+cross-check for this in Terraform; a mismatch surfaces as an OCI API error or a boot failure, not a
+plan-time error.
+
+### kubeadm's hard requirements shape the node split, not just Always Free math
+
+Two `kubeadm` preflight checks are hard failures (the bootstrap script uses `set -e`, so either one aborts
+`k8s-node-init.sh.tftpl` before it finishes, and the control-plane's `kubeadm-join.sh` never gets written):
+
+- **`NumCPU`**: `kubeadm init` refuses to run with fewer than 2 CPUs on the control-plane
+  (`[ERROR NumCPU]: the number of available CPUs 1 is less than the required 2`). This is why the
+  control-plane takes the *entire* 2 OCPU/12 GB Ampere A1 allowance instead of sharing it with a worker —
+  splitting it 1+1 (the first attempt at this sizing) looks reasonable against the free-tier math but
+  silently fails to bring up the cluster. `kubeadm join` (workers) has no equivalent CPU floor.
+- **`FileExisting-conntrack`**: `conntrack` isn't part of Ubuntu 24.04's base image or pulled in by
+  containerd's apt dependencies, so `k8s-node-init.sh.tftpl` installs it explicitly alongside
+  kubeadm/kubelet/kubectl. Needed on every node (kube-proxy needs it too), not just the control-plane.
+
+If `kubeadm-join.sh` is missing from the control-plane's home directory after cloud-init should have
+finished, check `/var/log/k8s-node-init.log` (or `/var/log/cloud-init-output.log`) there first — a preflight
+failure like the above is far more likely than cloud-init still running.
 
 ### Always Free sizing is fragile — re-verify before resizing
 
 Oracle cut the Always Free **Ampere A1** allowance in half tenancy-wide partway through 2026 (was 4 OCPU /
 24 GB, now 2 OCPU / 12 GB — see [Oracle's Always Free docs](https://docs.oracle.com/iaas/Content/FreeTier/freetier.htm)),
-with enforcement starting 2026-08-18 and no real announcement beyond a docs edit. The two A1 nodes here
-(`k8s-control-plane`, `k8s-worker-1`) are sized to use exactly that reduced allowance — 1 OCPU/6 GB each.
-Going over it (another A1 instance, or bumping `ocpus`/`memory_in_gbs`) risks the excess A1 instances being
-disabled and deleted per Oracle's documented behavior (or billed, on an upgraded/PAYG tenancy — reporting on
-this was inconsistent). `k8s-worker-2` deliberately uses the *separate* AMD Micro Always Free pool
-(`VM.Standard.E2.1.Micro`, up to 2 instances tenancy-wide) instead of a 3rd A1 instance, specifically to add
-a node without spending any A1 quota. Given Oracle already cut this once without notice, re-check current
-Always Free limits before changing instance counts/sizes rather than trusting the numbers in this file or
-README.md to still be current.
+with enforcement starting 2026-08-18 and no real announcement beyond a docs edit. The control-plane here is
+sized to use exactly that reduced allowance — 2 OCPU/12 GB, all of it (see above for why it can't be split
+across nodes). Provisioning a second A1 instance, or bumping the control-plane's `ocpus`/`memory_in_gbs`
+further, risks the excess A1 usage being disabled and deleted per Oracle's documented behavior (or billed,
+on an upgraded/PAYG tenancy — reporting on this was inconsistent). Both workers deliberately use the
+*separate* AMD Micro Always Free pool (`VM.Standard.E2.1.Micro`, up to 2 instances tenancy-wide) instead of
+A1, specifically to add nodes without spending any A1 quota. Given Oracle already cut this once without
+notice, re-check current Always Free limits before changing instance counts/sizes rather than trusting the
+numbers in this file or README.md to still be current.
 
 ### State and secrets are local, not committed
 
